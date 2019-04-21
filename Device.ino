@@ -4,24 +4,65 @@
 #include <Temp.h>
 #include <RFade.h>
 #include <arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
+//#define DHTPIN 2
+//#define DHTTYPE DHT11
+#define OLED_RESET 4
+Adafruit_SSD1306 display(OLED_RESET);
+
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
 Fade fade;
 Temp temp;
 
 DS3231 rtc(SDA, SCL);
 
+//averaging code here:
+const int numSoundReadings = 5;
+const int numAirReadings = 5;
+const int numTempReadings = 5;
+ 
+int soundReadings[numSoundReadings];      // the soundReadings from the analog input
+int soundReadIndex = 0;              // the index of the current reading
+int soundTotal = 0;                  // the running soundTotal
+
+int airReadings[numAirReadings];      // the soundReadings from the analog input
+int airReadIndex = 0;              // the index of the current reading
+int airTotal = 0;                  // the running soundTotal
+
+int tempReadings[numTempReadings];      // the soundReadings from the analog input
+int tempReadIndex = 0;              // the index of the current reading
+int tempTotal = 0;                  // the running soundTotal
 
 
+int soundAv = 0;                // the average sound
+int airAv = 0;                  // the average air
+float tempAv = 0;                 // the average temp
+
+
+//sensor declarations
 int Te1;
-int Te2;
+float Te2;
 int airQual;
-float airSens = A1;
+int airSens = A1;
+int soundSens = A2;
+int soundVol;
+long SR; // Seconds remaining on display
+long CDT; //count down timer for display
 
 int stateC = 0;
 int stateP = -1;
 unsigned long uTime;
 
-String mySSID = "Esp";       // WiFi SSID
+bool inverted = false;
+
+String mySSID = "ESP";       // WiFi SSID
 String myPWD = "1234567890"; // WiFi Password
 String myAPI = "FQDMKIUBU5BEC0JJ";   // API Key
 String myHOST = "api.thingspeak.com";
@@ -29,6 +70,7 @@ String myPORT = "80";
 String myFIELD1 = "field1";
 String myFIELD2 = "field2";
 String myFIELD3 = "field3";
+String myFIELD4 = "field4";
 String sendData;
 
 char kwBusy[] = "busy p...";
@@ -54,22 +96,62 @@ char receivedChars[numChars]; // an array to store the received data.
 boolean newData = false;
 
 void setup() {
+  Wire.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3c);// initialize with the I2C addr 0x3C
 
+  //init smoothing array for sound
+  for (int thisReading = 0; thisReading < numSoundReadings; thisReading++) {
+    soundReadings[thisReading] = 0;
+  }
+  
+  pinMode(soundSens, INPUT);
   pinMode(airSens, INPUT);
   Serial.begin(115200);
   Serial3.begin(115200);
   rtc.begin();
   // The following lines can be uncommented to set the date and time
-  //rtc.setDOW(WEDNESDAY);     // Set Day-of-Week to SUNDAY
-  //rtc.setTime(12, 0, 0);     // Set the time to 12:00:00 (24hr format)
-  //rtc.setDate(1, 1, 2014);   // Set the date to January 1st, 2014
+  //rtc.setDOW(THURSDAY);     // Set Day-of-Week to SUNDAY
+  //rtc.setTime(11, 11, 0);     // Set the time to 12:00:00 (24hr format)
+  //rtc.setDate(4, 4, 2019);   // Set the date to January 1st, 2014
   Serial.println("\n\n\n\n\n\n\n\n\n\n                                Arduino is Ready...\n\n\n\n");
   while (Serial3.available()) {
     Serial.read();
   }
+}
+void Display() {
+
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(5, 0);
+  display.print("Temp: ");
+  display.print(tempAv);
+  display.print("c");
+  //  display.print(" T2: ");
+  //  display.print(Te1);
+  //  display.print("c");
+  display.setCursor(5, 10);
+  display.print("Air: ");
+  display.print(airAv);
+  display.setCursor(5, 20);
+  display.print("Time: ");
+  display.print(rtc.getTimeStr());
+  display.setCursor(5, 30);
+  display.print("State: ");
+  display.print(stateC);
+  display.print("  dB: ");
+  display.print(soundAv);
+  display.setCursor(5, 40);
+  display.print("Remaining: ");
+  display.print(SR / 1000);
+  display.print(".");
+  display.print((SR % 1000) / 100);
+  display.setCursor(5, 50);
+  display.print("Clock: ");
+  display.print(millis());
+
 
 }
-
 bool timeout() {
   TOcms = millis();
   if ((TOcms - TOpms) >= TOInterv) { //  watchdog
@@ -81,6 +163,7 @@ bool timeout() {
   }
 }
 bool rec(char * TargetStr) {  // need to make this return a string type and then use it to test the resutl of the serial port.
+
   int TargetLen = strlen(TargetStr);
   static byte ndx = 0;  // this is a byte that saves the index of the array where the bytes will be stored.
   static byte TargetRecNDX = 0;
@@ -128,8 +211,10 @@ void SM() {
         break;
       }
       // wait for the kw timer
-      TOInterv = 400;
+      TOInterv = 2000;
       if (timeout()) {
+        Serial.println();
+        Serial.println("TIMEOUT");
         stateC = 0;
         break;
       }
@@ -152,7 +237,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -171,7 +256,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -179,10 +264,11 @@ void SM() {
       Serial3.print("ATE0\r\n");
       stateC = 5;
       TOpms = millis();
+      timeClient.begin();
       break;
 
     case 5:
-    delay(300);
+      delay(300);
       if (rec(kwOK)) {
         stateC = 6;
         TOpms = millis();
@@ -197,7 +283,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -205,7 +291,7 @@ void SM() {
       Serial3.print("AT+CIPMODE=0\r\n");
       Serial.print("AT+CIPMODE=0\r\n");
       stateC = 7;
-      
+
       break;
 
     case 7:
@@ -224,7 +310,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -251,7 +337,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -278,7 +364,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -305,7 +391,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -319,6 +405,14 @@ void SM() {
 
     case 15:
       if (rec(kwSendOK)) {
+        if (inverted) {
+          display.invertDisplay(false);
+          inverted = false;
+        }
+        else {
+          display.invertDisplay(true);
+          inverted = true;
+        }
         stateC = 16;
         TOpms = millis();
         break;
@@ -332,7 +426,7 @@ void SM() {
         break;
       }
       else {
-        
+
         break;
       }
 
@@ -357,41 +451,111 @@ void SM() {
         stateC = 30;
         break;
       }
-        break;
+      break;
 
-case 30:
-  TOInterv = 60000;
+    case 30:
+      if (TOInterv != 60000) {
+        TOInterv = 60000;
+        CDT = millis();
+      }
       if (timeout()) {
         Serial.println();
         Serial.println("TIMEOUT");
         stateC = 10;
+        SR = 0;
         break;
       }
       else {
+        SR = ((CDT + TOInterv) - millis());
         
+
         break;
       }
-
 
     case 20:
       Serial.println("Not Connected, Trying to connect now.....");
       Serial3.print("AT+CWJAP=\"" + mySSID + "\",\"" + myPWD + "\"");
       stateC = 2;
       break;
+
+
+
   }
 }
+
 void Sensors() {
 
   //temp:
   Te1 = rtc.getTemp();
   Te2 = temp.tempRead();
 
+  // subtract the last reading:
+  tempTotal = tempTotal - tempReadings[tempReadIndex];
+  // read from the sensor:
+  tempReadings[tempReadIndex] = Te2;
+  // add the reading to the tempTotal:
+  tempTotal = tempTotal + tempReadings[tempReadIndex];
+  // advance to the next position in the array:
+  tempReadIndex = tempReadIndex + 1;
+ 
+  // if we're at the end of the array...
+  if (tempReadIndex >= numTempReadings) {
+    // ...wrap around to the beginning:
+    tempReadIndex = 0;
+  }
+ 
+  // calculate the average:
+  tempAv = tempTotal / numTempReadings;
+
+
   //air:
   airQual = analogRead(airSens);
 
+  // subtract the last reading:
+  airTotal = airTotal - airReadings[airReadIndex];
+  // read from the sensor:
+  airReadings[airReadIndex] = airQual;
+  // add the reading to the airTotal:
+  airTotal = airTotal + airReadings[airReadIndex];
+  // advance to the next position in the array:
+  airReadIndex = airReadIndex + 1;
+ 
+  // if we're at the end of the array...
+  if (airReadIndex >= numAirReadings) {
+    // ...wrap around to the beginning:
+    airReadIndex = 0;
+  }
+ 
+  // calculate the average:
+  airAv = airTotal / numAirReadings;
+
+
+
+
+  //sound:
+  soundVol = analogRead(soundSens);
+  
+  // subtract the last reading:
+  soundTotal = soundTotal - soundReadings[soundReadIndex];
+  // read from the sensor:
+  soundReadings[soundReadIndex] = soundVol;
+  // add the reading to the soundTotal:
+  soundTotal = soundTotal + soundReadings[soundReadIndex];
+  // advance to the next position in the array:
+  soundReadIndex = soundReadIndex + 1;
+ 
+  // if we're at the end of the array...
+  if (soundReadIndex >= numSoundReadings) {
+    // ...wrap around to the beginning:
+    soundReadIndex = 0;
+  }
+ 
+  // calculate the average:
+  soundAv = soundTotal / numSoundReadings;
+  
+  
+
 }
-
-
 void Cat() {
 
   sendData = "GET /update?api_key=";
@@ -408,15 +572,32 @@ void Cat() {
   sendData += myFIELD3;
   sendData += "=";
   sendData += String(airQual);
-  sendData +="\r\n\r\n";
+  sendData += "&";
+  sendData += myFIELD4;
+  sendData += "=";
+  sendData += String(soundVol);
+  sendData += "\r\n\r\n";
 }
-
 void loop() {
-  Sensors();
-  fade.breathe(); // Fade led with a sine wave value.
-  
   SM(); //run the state machine
-  
+
+  Display();
+
+  SM(); //run the state machine
+
+  display.display();
+
+  SM(); //run the state machine
+
+  Sensors();
+
+  SM(); //run the state machine
+
+  fade.breathe(); // Fade led with a sine wave value.
+
+  SM(); //run the state machine
+
+
   if (stateP != stateC) { // check to see if the state has changed from last.
     Serial.println();
     Serial.println();
@@ -428,14 +609,8 @@ void loop() {
     Serial.print(rtc.getTemp());
     Serial.println(" Degrees Centergrade");
     Serial.println();
+
   }
 }
 
 
-/*
-  AT+CIPSTART="TCP","api.thingspeak.com",80
-  AT+CIPSEND=46
-  GET /update?api_key=FQDMKIUBU5BEC0JJ&field1=21
-  AT+CIPCLOSE
-  GET https://api.thingspeak.com/update?api_key=FQDMKIUBU5BEC0JJ&field1=00
-*/
